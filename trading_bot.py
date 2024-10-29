@@ -7,10 +7,10 @@ import hmac
 import hashlib
 
 class TradingBot:
-    def __init__(self, api_key, api_secret, symbol="BTCUSDT", timeframe="15", leverage=20, pause=15, frequency=10, risk_perc=0.02):
+    def __init__(self, api_key, api_secret, symbol="BTCUSDT", timeframe="15", leverage=10, pause=15, frequency=10, risk_perc=-0.2):
         self.api_key = api_key
         self.api_secret = api_secret
-        self.base_url = "https://api-testnet.bybit.com"  # Testnet URL
+        self.base_url = "https://api-demo.bybit.com"  # Testnet URL
         self.symbol = symbol
         self.timeframe = timeframe
         self.leverage = leverage
@@ -19,6 +19,7 @@ class TradingBot:
         self.risk_perc = risk_perc
         self.last_close_time = datetime.now() - self.pause
         self.position = None
+        self.position_mode = "one_way"  # Set position mode to either "hedge" or "one_way"
 
         # Set leverage on initialization
         self.set_leverage()
@@ -35,15 +36,46 @@ class TradingBot:
             params = {}
         params['api_key'] = self.api_key
         params['timestamp'] = self._get_timestamp()
-        params['sign'] = self._generate_signature(params)
         
+        # Ensure 'reduceOnly' is a lowercase string
+        if 'reduceOnly' in params:
+            params['reduceOnly'] = 'true' if params['reduceOnly'] else 'false'
+        
+        # Sort parameters alphabetically and create signature
+        sorted_params = dict(sorted(params.items()))
+        params['sign'] = self._generate_signature(sorted_params)
+
         url = f"{self.base_url}{endpoint}"
-        if method == "GET":
-            response = requests.get(url, params=params)
-        elif method == "POST":
-            response = requests.post(url, json=params)
-        print(f"Request sent to {url}, Method: {method}, Params: {params}")
-        return response.json()
+        try:
+            if method == "GET":
+                response = requests.get(url, params=params)
+            elif method == "POST":
+                response = requests.post(url, json=params)
+            
+            # Log the request details
+            print(f"Request sent to {url}, Method: {method}, Params: {params}")
+            
+            # Check response status code and handle non-JSON responses
+            if response.status_code != 200:
+                print(f"Error: Received status code {response.status_code}")
+                print("Response text:", response.text)
+                return None
+            
+            # Attempt to parse JSON
+            return response.json()
+        
+        except requests.exceptions.RequestException as e:
+            print("Network error:", e)
+            return None
+        
+        except requests.exceptions.JSONDecodeError:
+            print("Error: Failed to parse JSON response")
+            print("Status Code:", response.status_code)
+            print("Response Headers:", response.headers)
+            print("Response text:", response.text)
+            return None
+
+
 
     def fetch_data(self):
         """Fetches historical data and calculates indicators."""
@@ -120,12 +152,29 @@ class TradingBot:
         endpoint = "/v5/account/wallet-balance"
         params = {"accountType": "UNIFIED"}
         balance_data = self.send_request("GET", endpoint, params)
-        if balance_data['retCode'] == 0:
-            balance = float(balance_data['result']['list'][0]['walletBalance'])
-            print(f"Current balance: {balance} USDT")
-            return balance
-        else:
-            print(f"Error fetching balance: {balance_data['retMsg']}")
+        
+        # Check if balance_data is valid
+        if balance_data is None:
+            print("Error: No valid response received for account balance.")
+            return 0
+
+        try:
+            # Traverse the nested structure based on the provided raw response
+            if balance_data.get('retCode') == 0:
+                coins = balance_data['result']['list'][0]['coin']
+                for coin in coins:
+                    if coin['coin'] == 'USDT':
+                        balance = float(coin['walletBalance'])
+                        print(f"Current balance: {balance} USDT")
+                        return balance
+                print("USDT balance not found.")
+                return 0
+            else:
+                print(f"Error fetching balance: {balance_data.get('retMsg', 'Unknown error')}")
+                return 0
+        except (KeyError, TypeError) as e:
+            print(f"Error processing balance data: {e}")
+            print("Raw response:", balance_data)
             return 0
 
     def determine_position(self, df):
@@ -167,8 +216,9 @@ class TradingBot:
         return entry_condition
 
     def place_order(self, side, amount):
-        """Places a market order."""
+        """Places a market order with conditional positionIdx based on position mode."""
         print(f"Placing {side} order with amount: {amount}")
+
         endpoint = "/v5/order/create"
         params = {
             "category": "linear",
@@ -177,16 +227,25 @@ class TradingBot:
             "orderType": "Market",
             "qty": str(amount)
         }
+
+        # Only include positionIdx if in Hedge Mode
+        if self.position_mode == "hedge":
+            position_idx = 2 if side.lower() == 'sell' else 1
+            params["positionIdx"] = position_idx
+
         response = self.send_request("POST", endpoint, params)
-        if response['retCode'] == 0:
+        if response and response.get('retCode') == 0:
             print(f"{side.capitalize()} order placed successfully.")
             return response['result']
         else:
-            print(f"Error placing order: {response['retMsg']}")
+            print(f"Error placing order: {response.get('retMsg', 'Unknown error')}")
             return None
+
 
     def run(self):
         """Main function to run the bot."""
+        MIN_ORDER_SIZE = 0.001  # Set minimum order size for BTCUSDT
+
         while True:
             now = datetime.now()
             if now - self.last_close_time < self.pause:
@@ -208,13 +267,32 @@ class TradingBot:
             if position and not self.position:
                 if self.check_entry_conditions(df, position):
                     balance = self.get_balance()
-                    amount = balance * self.risk_perc / df['close'].iloc[-1]
-                    stop_loss, take_profit = self.calculate_volatility_based_risk(df)
-                    self.position = self.place_order(position, amount)
-                    self.position['stop_loss'] = stop_loss
-                    self.position['take_profit'] = take_profit
-                    self.position['entry_price'] = df['close'].iloc[-1]
+                    if balance == 0:
+                        print("No available balance; skipping trade.")
+                        time.sleep(self.frequency)
+                        continue
 
+                    # Calculate amount and ensure it's positive
+                    amount = abs(balance * self.risk_perc / df['close'].iloc[-1])
+                    
+                    # Ensure the amount meets the minimum order size
+                    if amount < MIN_ORDER_SIZE:
+                        print(f"Calculated amount {amount} is below minimum order size. Adjusting to minimum size.")
+                        amount = MIN_ORDER_SIZE
+
+                    stop_loss, take_profit = self.calculate_volatility_based_risk(df)
+                    order = self.place_order(position, 0.2)
+                    
+                    # Only update self.position if the order was placed successfully
+                    if order:
+                        self.position = order
+                        self.position['stop_loss'] = stop_loss
+                        self.position['take_profit'] = take_profit
+                        self.position['entry_price'] = df['close'].iloc[-1]
+                    else:
+                        print("Order placement failed; retrying on next cycle.")
+
+            # Check if there’s an open position and evaluate conditions to close it
             if self.position:
                 current_price = df['close'].iloc[-1]
                 if (current_price <= self.position['entry_price'] - self.position['stop_loss'] or
@@ -226,6 +304,8 @@ class TradingBot:
 
             print(f"Indicators - Time: {now}, EMA200: {df['EMA200'].iloc[-1]}, EMA90: {df['EMA90'].iloc[-1]}, RSI: {df['RSI12'].iloc[-1]}")
             time.sleep(self.frequency)
+
+
 
 # Initialize and run the bot
 api_key = "T6noPR0fneMpM9FOhn"
